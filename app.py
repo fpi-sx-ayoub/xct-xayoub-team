@@ -294,6 +294,10 @@ async def _query(uid, sx):
         try: await wr.wait_closed()
         except: pass
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'}), 200
+
 @app.route('/s')
 def route_s():
     uid = request.args.get('uid', '').strip()
@@ -307,4 +311,6 @@ def route_s():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
