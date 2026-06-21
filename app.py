@@ -9,11 +9,20 @@ from Crypto.Util.Padding import pad, unpad
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-_ID  = '4665582275'
-_PW  = 'FPISX74WUE'
+
+# تحميل الحسابات من accs.json
+try:
+    with open('accs.json', 'r') as f:
+        ACCOUNTS = json.load(f)
+    print(f"[+] تم تحميل {len(ACCOUNTS)} حساب من accs.json")
+except Exception as e:
+    print(f"[-] خطأ في تحميل accs.json: {e}")
+    ACCOUNTS = {}
+
 _TTL = 6 * 60 * 60
 _cx  = {}
 _lk  = threading.Lock()
+_failed_accounts = set()  # تتبع الحسابات الفاشلة
 
 _Hr = {
     'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)',
@@ -213,51 +222,82 @@ async def _auth(uid, tok, ts, k, v):
     el = await _hx(len(e) // 2)
     return f"0115{hd}{uh}{await _hx(ts)}00000{el}{e}"
 
-async def _login():
+async def _login(uid=None, password=None):
+    """
+    محاولة تسجيل الدخول باستخدام حساب محدد أو حساب من القائمة
+    """
     sx = ssl.create_default_context()
     sx.check_hostname = False; sx.verify_mode = ssl.CERT_NONE
 
-    async with aiohttp.ClientSession() as s:
-        async with s.post('https://100067.connect.garena.com/oauth/guest/token/grant', headers=_Hr,
-            data={'uid':_ID,'password':_PW,'response_type':'token','client_type':'2',
-                  'client_secret':'2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3',
-                  'client_id':'100067'}, ssl=sx) as r:
-            if r.status != 200: raise Exception(f"OAuth {r.status}")
-            d = await r.json()
-            oid = d['open_id']; atk = d['access_token']
+    # إذا لم يتم توفير حساب، جرب الحسابات المتاحة
+    if uid is None or password is None:
+        for acc_uid, acc_pwd in ACCOUNTS.items():
+            if acc_uid not in _failed_accounts:
+                uid, password = acc_uid, acc_pwd
+                break
+        else:
+            raise Exception(f"لا توجد حسابات متاحة. تم تحميل {len(ACCOUNTS)} حساب، لكن جميعها فاشلة")
+    
+    print(f"[*] محاولة تسجيل الدخول بالحساب: {uid}")
 
-    raw = await _mkLogin(oid, atk)
-    ep  = AES.new(b'Yg&tc%DEuh6%Zc^8', AES.MODE_CBC, b'6oyZDr22E3ychjM%').encrypt(pad(raw, 16))
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post('https://100067.connect.garena.com/oauth/guest/token/grant', headers=_Hr,
+                data={'uid':uid,'password':password,'response_type':'token','client_type':'2',
+                      'client_secret':'2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3',
+                      'client_id':'100067'}, ssl=sx, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200: 
+                    raise Exception(f"OAuth {r.status}")
+                d = await r.json()
+                oid = d['open_id']; atk = d['access_token']
 
-    async with aiohttp.ClientSession() as s:
-        async with s.post('https://loginbp.ggpolarbear.com/MajorLogin', data=ep, headers=_Hr, ssl=sx) as r:
-            if r.status != 200: raise Exception(f"MajorLogin {r.status}")
-            mr = await r.read()
+        raw = await _mkLogin(oid, atk)
+        ep  = AES.new(b'Yg&tc%DEuh6%Zc^8', AES.MODE_CBC, b'6oyZDr22E3ychjM%').encrypt(pad(raw, 16))
 
-    mlr = _pbF(mr)
-    tok = mlr[8].decode()
-    tgt = mlr[1]
-    k   = mlr[22]
-    v   = mlr[23]
-    ts  = mlr[21]
-    url = mlr[10].decode()
+        async with aiohttp.ClientSession() as s:
+            async with s.post('https://loginbp.ggpolarbear.com/MajorLogin', data=ep, headers=_Hr, ssl=sx, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200: 
+                    raise Exception(f"MajorLogin {r.status}")
+                mr = await r.read()
 
-    h2 = {**_Hr, 'Authorization': f'Bearer {tok}'}
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{url}/GetLoginData", data=ep, headers=h2, ssl=sx) as r:
-            if r.status != 200: raise Exception(f"GetLoginData {r.status}")
-            lr = await r.read()
+        mlr = _pbF(mr)
+        tok = mlr[8].decode()
+        tgt = mlr[1]
+        k   = mlr[22]
+        v   = mlr[23]
+        ts  = mlr[21]
+        url = mlr[10].decode()
 
-    ld = _pbF(lr)
-    ip, port = ld[14].decode().split(':')
-    at = await _auth(int(tgt), tok, int(ts), k, v)
-    print(f"\n ACCOUNT ID --> {tgt}\n JWT TOKEN: {tok[:50]}...\n BOT ON\n")
-    return {'account_id':tgt,'token':tok,'key':k,'iv':v,'ip':ip,'port':int(port),'auth':at,'exp':time.time()+_TTL}
+        h2 = {**_Hr, 'Authorization': f'Bearer {tok}'}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{url}/GetLoginData", data=ep, headers=h2, ssl=sx, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200: 
+                    raise Exception(f"GetLoginData {r.status}")
+                lr = await r.read()
+
+        ld = _pbF(lr)
+        ip, port = ld[14].decode().split(':')
+        at = await _auth(int(tgt), tok, int(ts), k, v)
+        print(f"\n[+] تم الاتصال بنجاح!\n    ACCOUNT ID: {tgt}\n    JWT TOKEN: {tok[:50]}...\n")
+        return {'account_id':tgt,'token':tok,'key':k,'iv':v,'ip':ip,'port':int(port),'auth':at,'exp':time.time()+_TTL, 'uid': uid}
+    
+    except Exception as e:
+        print(f"[-] فشل الاتصال بالحساب {uid}: {e}")
+        _failed_accounts.add(uid)
+        # محاولة حساب آخر
+        if uid in ACCOUNTS:
+            del ACCOUNTS[uid]
+        # جرب حساب آخر
+        for acc_uid, acc_pwd in ACCOUNTS.items():
+            if acc_uid not in _failed_accounts:
+                return await _login(acc_uid, acc_pwd)
+        raise Exception(f"فشلت جميع محاولات الاتصال. تم تجربة {len(_failed_accounts)} حساب")
 
 def _sess():
     with _lk:
         s = _cx.get('s')
-        if s and time.time() < s['exp']: return s
+        if s and time.time() < s['exp']: 
+            return s
     ns = asyncio.run(_login())
     with _lk: _cx['s'] = ns
     return ns
@@ -297,6 +337,25 @@ async def _query(uid, sx):
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'}), 200
+
+@app.route('/status')
+def status():
+    """عرض حالة الاتصال والحسابات المتاحة"""
+    try:
+        with _lk:
+            current_session = _cx.get('s')
+        return jsonify({
+            'ok': True,
+            'data': {
+                'connected_accounts': 1 if current_session else 0,
+                'total_accounts_loaded': len(ACCOUNTS),
+                'failed_accounts': len(_failed_accounts),
+                'active_session_uid': current_session.get('uid') if current_session else None,
+                'session_expires_in_seconds': int(current_session['exp'] - time.time()) if current_session else 0,
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/s')
 def route_s():
